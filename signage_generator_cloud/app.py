@@ -8,8 +8,7 @@ import pandas as pd
 import streamlit as st
 from openpyxl.worksheet.worksheet import Worksheet
 
-REQUIRED_PLANS = ["Plan1", "Plan2", "Plan3"]
-WEEKEND_SUFFIX = " (주말)"
+PLAN_OPTIONS = ["Plan1", "Plan2", "Plan3", "Plan1 (주말)", "Plan2 (주말)", "Plan3 (주말)"]
 HEADER_KEYWORDS = {
     "date": ["날짜", "일자"],
     "alarm": ["알람", "알림"],
@@ -19,10 +18,6 @@ HEADER_KEYWORDS = {
 }
 TIME_FORMAT = "hh:mm"
 DATE_FORMAT = "m월 d일"
-
-
-def is_weekend(d: date) -> bool:
-    return d.weekday() >= 5
 
 
 def normalize(v) -> str:
@@ -66,11 +61,7 @@ def row_has_schedule_data(ws: Worksheet, row_idx: int, cols: Dict[str, int]) -> 
 
 
 def source_data_rows(ws: Worksheet, header_row: int, cols: Dict[str, int]) -> List[int]:
-    rows: List[int] = []
-    for r in range(header_row + 1, ws.max_row + 1):
-        if row_has_schedule_data(ws, r, cols):
-            rows.append(r)
-    return rows
+    return [r for r in range(header_row + 1, ws.max_row + 1) if row_has_schedule_data(ws, r, cols)]
 
 
 def last_used_row(ws: Worksheet, cols: Optional[Dict[str, int]] = None) -> int:
@@ -141,20 +132,23 @@ def calc_alarm(start_value):
     return None
 
 
-def select_source_sheet(plan: str, d: date) -> str:
-    return f"{plan}{WEEKEND_SUFFIX}" if is_weekend(d) else plan
-
-
 def format_date_cell(cell, d: date) -> None:
     cell.value = datetime(d.year, d.month, d.day)
     cell.number_format = DATE_FORMAT
 
 
-def build_workbook(uploaded_file, schedule_items: pd.DataFrame, clear_existing: bool, target_sheet_name: str) -> Tuple[BytesIO, List[Dict[str, str]]]:
+def get_target_sheet(wb, target_sheet_name: str):
+    name = target_sheet_name.strip()
+    if name:
+        if name not in wb.sheetnames:
+            raise ValueError(f"'{name}' 시트를 찾지 못했습니다. 출력 시트명을 확인하세요.")
+        return wb[name]
+    return wb.worksheets[0]
+
+
+def build_workbook(uploaded_file, schedule_items: List[Dict], clear_existing: bool, target_sheet_name: str) -> Tuple[BytesIO, List[Dict[str, str]]]:
     wb = openpyxl.load_workbook(uploaded_file)
-    if target_sheet_name not in wb.sheetnames:
-        raise ValueError(f"'{target_sheet_name}' 시트를 찾지 못했습니다. 첫 번째 출력 시트 이름을 확인하세요.")
-    target_ws = wb[target_sheet_name]
+    target_ws = get_target_sheet(wb, target_sheet_name)
     target_header_row, target_cols = find_header(target_ws)
     if clear_existing:
         clear_schedule_body(target_ws, target_header_row, target_cols)
@@ -164,17 +158,18 @@ def build_workbook(uploaded_file, schedule_items: pd.DataFrame, clear_existing: 
     logs: List[Dict[str, str]] = []
     source_cache: Dict[str, Tuple[int, Dict[str, int], List[int]]] = {}
 
-    valid_rows = schedule_items.dropna(subset=["date", "plan"])
-    for _, item in valid_rows.iterrows():
-        d = item["date"]
+    for item in schedule_items:
+        d = item.get("date")
+        plan = str(item.get("plan", "")).strip()
+        if not d or not plan:
+            continue
         if isinstance(d, pd.Timestamp):
             d = d.date()
         elif isinstance(d, datetime):
             d = d.date()
-        plan = str(item["plan"]).strip()
-        src_sheet_name = select_source_sheet(plan, d)
+        src_sheet_name = plan
         if src_sheet_name not in wb.sheetnames:
-            raise ValueError(f"'{src_sheet_name}' 시트가 없습니다. 평일/주말용 6개 시트명을 확인하세요.")
+            raise ValueError(f"'{src_sheet_name}' 시트가 없습니다. 6개 타임테이블 시트명을 확인하세요.")
         src_ws = wb[src_sheet_name]
         if src_sheet_name not in source_cache:
             header_row, src_cols = find_header(src_ws)
@@ -200,8 +195,7 @@ def build_workbook(uploaded_file, schedule_items: pd.DataFrame, clear_existing: 
             append_row += 1
         logs.append({
             "날짜": d.strftime("%Y-%m-%d"),
-            "선택 플랜": plan,
-            "적용 시트": src_sheet_name,
+            "선택 시트": src_sheet_name,
             "입력 행수": str(append_row - start_append_row),
         })
     if target_ws.auto_filter:
@@ -212,56 +206,93 @@ def build_workbook(uploaded_file, schedule_items: pd.DataFrame, clear_existing: 
     return output, logs
 
 
+def init_items():
+    if "schedule_items" not in st.session_state:
+        st.session_state.schedule_items = [
+            {"date": date(2026, 4, 1), "plan": "Plan1"},
+        ]
+
+
+def add_item():
+    items = st.session_state.schedule_items
+    next_date = items[-1]["date"] + timedelta(days=1) if items and items[-1].get("date") else date.today()
+    items.append({"date": next_date, "plan": "Plan1"})
+
+
+def remove_item(idx: int):
+    if 0 <= idx < len(st.session_state.schedule_items):
+        st.session_state.schedule_items.pop(idx)
+    if not st.session_state.schedule_items:
+        st.session_state.schedule_items.append({"date": date.today(), "plan": "Plan1"})
+
+
 st.set_page_config(page_title="HMG 사이니지 스케줄 생성기", layout="wide")
 st.title("HMG 사이니지 스케줄 생성기")
-st.caption("엑셀을 직접 편집하지 않고 날짜와 플랜만 선택해 첫 번째 스케줄 시트에 타임테이블을 누적 입력합니다.")
+st.caption("날짜와 6개 타임테이블 시트를 직접 선택해 첫 번째 스케줄 시트에 누적 입력합니다.")
+init_items()
 
 with st.sidebar:
     st.header("1. 기준 엑셀")
     uploaded = st.file_uploader("6개 타임테이블 시트가 들어있는 엑셀 업로드", type=["xlsx"])
-    target_sheet_name = st.text_input("출력 시트명", value="스케줄")
+    target_sheet_name = st.text_input("출력 시트명", value="스케줄", help="비워두면 통합문서의 첫 번째 시트를 사용합니다.")
     clear_existing = st.checkbox("기존 스케줄 내용 삭제 후 새로 생성", value=True)
     st.divider()
-    st.header("시트명 규칙")
-    st.write("평일: Plan1, Plan2, Plan3")
-    st.write("주말: Plan1 (주말), Plan2 (주말), Plan3 (주말)")
+    st.header("필요 시트")
+    st.write("Plan1 / Plan2 / Plan3")
+    st.write("Plan1 (주말) / Plan2 (주말) / Plan3 (주말)")
 
-st.subheader("2. 날짜별 플랜 입력")
-st.write("날짜 하나당 플랜 하나를 선택하세요. 토/일이면 주말 시트가 자동 적용됩니다.")
+st.subheader("2. 날짜별 타임테이블 선택")
+st.write("주말 자동인식은 사용하지 않습니다. 필요한 경우 `Plan1 (주말)`처럼 주말 시트를 직접 선택하세요.")
 
-base_df = pd.DataFrame([
-    {"date": date(2026, 4, 1), "plan": "Plan1"},
-    {"date": date(2026, 4, 2), "plan": "Plan2"},
+for i, item in enumerate(st.session_state.schedule_items):
+    c1, c2, c3 = st.columns([1.3, 1.5, 0.6])
+    with c1:
+        st.session_state.schedule_items[i]["date"] = st.date_input(
+            "날짜",
+            value=item.get("date") or date.today(),
+            key=f"date_{i}",
+        )
+    with c2:
+        current_plan = item.get("plan") if item.get("plan") in PLAN_OPTIONS else PLAN_OPTIONS[0]
+        st.session_state.schedule_items[i]["plan"] = st.selectbox(
+            "타임테이블 시트",
+            options=PLAN_OPTIONS,
+            index=PLAN_OPTIONS.index(current_plan),
+            key=f"plan_{i}",
+        )
+    with c3:
+        st.write("")
+        st.write("")
+        if st.button("삭제", key=f"del_{i}", use_container_width=True):
+            remove_item(i)
+            st.rerun()
+
+c_add, c_clear = st.columns([1, 1])
+with c_add:
+    if st.button("날짜 추가", type="secondary", use_container_width=True):
+        add_item()
+        st.rerun()
+with c_clear:
+    if st.button("전체 초기화", use_container_width=True):
+        st.session_state.schedule_items = [{"date": date.today(), "plan": "Plan1"}]
+        st.rerun()
+
+preview = pd.DataFrame([
+    {"날짜": item["date"].strftime("%Y-%m-%d") if item.get("date") else "", "적용 시트": item.get("plan", "")}
+    for item in st.session_state.schedule_items
 ])
-items = st.data_editor(
-    base_df,
-    num_rows="dynamic",
-    use_container_width=True,
-    column_config={
-        "date": st.column_config.DateColumn("날짜", format="YYYY-MM-DD", required=True),
-        "plan": st.column_config.SelectboxColumn("플랜", options=REQUIRED_PLANS, required=True),
-    },
-    hide_index=True,
-)
-
-preview = items.copy()
-if not preview.empty and "date" in preview.columns:
-    preview["적용 시트"] = preview.apply(
-        lambda row: select_source_sheet(row["plan"], row["date"] if not isinstance(row["date"], pd.Timestamp) else row["date"].date())
-        if pd.notna(row.get("date")) and pd.notna(row.get("plan")) else "",
-        axis=1,
-    )
-    st.subheader("3. 적용 예정 미리보기")
-    st.dataframe(preview, use_container_width=True, hide_index=True)
+st.subheader("3. 적용 예정 미리보기")
+st.dataframe(preview, use_container_width=True, hide_index=True)
 
 if st.button("엑셀 생성", type="primary", use_container_width=True):
+    valid_items = [item for item in st.session_state.schedule_items if item.get("date") and item.get("plan")]
     if uploaded is None:
         st.error("기준 엑셀 파일을 먼저 업로드하세요.")
-    elif items.dropna(subset=["date", "plan"]).empty:
-        st.error("날짜와 플랜을 최소 1개 이상 입력하세요.")
+    elif not valid_items:
+        st.error("날짜와 타임테이블 시트를 최소 1개 이상 입력하세요.")
     else:
         try:
-            output, logs = build_workbook(uploaded, items, clear_existing, target_sheet_name)
+            output, logs = build_workbook(uploaded, valid_items, clear_existing, target_sheet_name)
             st.success("생성 완료")
             st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
             st.download_button(
@@ -273,4 +304,4 @@ if st.button("엑셀 생성", type="primary", use_container_width=True):
             )
         except Exception as e:
             st.error(str(e))
-            st.info("시트명, 첫 번째 출력 시트명, 헤더명(날짜/알람시간/시작예정시각/프로그램명/렉처룸)을 확인하세요.")
+            st.info("출력 시트명, 6개 타임테이블 시트명, 헤더명(날짜/알람시간/시작예정시각/프로그램명/렉처룸)을 확인하세요.")
